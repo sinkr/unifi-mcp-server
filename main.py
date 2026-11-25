@@ -71,11 +71,24 @@ LEGACY_PASS     = os.getenv("UNIFI_PASSWORD", "PASSWORD")
 SM_BASE         = os.getenv("UNIFI_SITEMGR_BASE", "").rstrip("/")
 SM_TOKEN        = os.getenv("UNIFI_SITEMGR_TOKEN", "")
 
-# Base URLs
-NET_INTEGRATION_BASE = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/network/integrations/v1"
-LEGACY_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/network/api"
-ACCESS_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/access/api/v1"
-PROTECT_BASE         = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/protect/api"
+# Deployment type: "unifi-os" (UDM/Cloud Key Gen2+, paths under /proxy/network)
+# vs "self-hosted"/"classic" (standalone Network app, paths at the bare root, login at /api/login).
+UNIFI_DEPLOYMENT = os.getenv("UNIFI_DEPLOYMENT", "unifi-os").lower()
+IS_CLASSIC       = UNIFI_DEPLOYMENT in ("self-hosted", "classic", "standalone")
+
+# Base URLs — classic controllers serve at the bare root; UniFi OS wraps everything in /proxy/<app>.
+if IS_CLASSIC:
+    NET_INTEGRATION_BASE = f"https://{UNIFI_HOST}:{UNIFI_PORT}/api/integration/v1"
+    LEGACY_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/api"
+    ACCESS_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/access/api/v1"
+    PROTECT_BASE         = f"https://{UNIFI_HOST}:{UNIFI_PORT}/protect/api"
+    LOGIN_PATH           = "/api/login"
+else:
+    NET_INTEGRATION_BASE = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/network/integrations/v1"
+    LEGACY_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/network/api"
+    ACCESS_BASE          = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/access/api/v1"
+    PROTECT_BASE         = f"https://{UNIFI_HOST}:{UNIFI_PORT}/proxy/protect/api"
+    LOGIN_PATH           = "/api/auth/login"
 
 REQUEST_TIMEOUT_S    = int(os.getenv("UNIFI_TIMEOUT_S", "15"))
 
@@ -171,7 +184,7 @@ def legacy_login():
     if not (LEGACY_USER and LEGACY_PASS):
         raise UniFiHTTPError("Legacy login requires UNIFI_USERNAME and UNIFI_PASSWORD.")
     
-    login_url = f"https://{UNIFI_HOST}:{UNIFI_PORT}/api/auth/login"
+    login_url = f"https://{UNIFI_HOST}:{UNIFI_PORT}{LOGIN_PATH}"
     validated_url = validate_url(login_url, "legacy login")
     
     r = LEGACY.post(
@@ -190,6 +203,10 @@ def legacy_get(path: str, params=None) -> Dict[str, Any]:
     validated_url = validate_url(url, "legacy GET")
     
     r = LEGACY.get(validated_url, params=params, verify=VERIFY_TLS, timeout=REQUEST_TIMEOUT_S)
+    if r.status_code == 401:
+        # Session cookie expired server-side; re-authenticate and retry once.
+        legacy_login()
+        r = LEGACY.get(validated_url, params=params, verify=VERIFY_TLS, timeout=REQUEST_TIMEOUT_S)
     return _raise_for(r)
 
 def legacy_post(path: str, body=None) -> Dict[str, Any]:
@@ -200,6 +217,10 @@ def legacy_post(path: str, body=None) -> Dict[str, Any]:
     validated_url = validate_url(url, "legacy POST")
     
     r = LEGACY.post(validated_url, json=body, verify=VERIFY_TLS, timeout=REQUEST_TIMEOUT_S)
+    if r.status_code == 401:
+        # Session cookie expired server-side; re-authenticate and retry once.
+        legacy_login()
+        r = LEGACY.post(validated_url, json=body, verify=VERIFY_TLS, timeout=REQUEST_TIMEOUT_S)
     return _raise_for(r)
 
 # ========= UniFi Protect helpers (with SSRF protection) =========
@@ -243,7 +264,43 @@ def protect_post(path: str, body=None) -> Dict[str, Any]:
     return _raise_for(r)
 
 # ========= Utilities =========
+def _classic_stat_path(path: str) -> Optional[str]:
+    """
+    Translate an Integration-API path (/sites/<id>/<resource>) into the classic
+    self-hosted stat/rest path (/s/<id>/stat/<resource>) used by standalone
+    Network controllers. Returns None if no mapping is known.
+    """
+    parts = [p for p in path.strip("/").split("/") if p]
+    # /sites  -> list sites
+    if parts == ["sites"]:
+        return "/self/sites"
+    # /sites/<id>/<resource>
+    if len(parts) >= 3 and parts[0] == "sites":
+        site = parts[1]
+        resource = parts[2]
+        mapping = {
+            "devices": f"/s/{site}/stat/device",
+            "clients": f"/s/{site}/stat/sta",      # active/connected clients
+            "wlans":   f"/s/{site}/rest/wlanconf",
+            "networks": f"/s/{site}/rest/networkconf",
+        }
+        return mapping.get(resource)
+    return None
+
 def paginate_integration(path: str, extra_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    # Classic self-hosted controllers don't serve the Integration API; route
+    # through the legacy stat/rest API (cookie auth) instead.
+    if IS_CLASSIC:
+        classic = _classic_stat_path(path)
+        if classic is None:
+            raise UniFiHTTPError(
+                f"No classic-controller mapping for integration path '{path}'. "
+                f"Set UNIFI_DEPLOYMENT=unifi-os if this is a UniFi OS console."
+            )
+        resp = legacy_get(classic)
+        # Classic API returns {"meta": {...}, "data": [...]}; no offset pagination.
+        return resp.get("data", []) if isinstance(resp, dict) else []
+
     params = {"limit": 200, "offset": 0}
     if extra_params:
         params.update(extra_params)
@@ -265,6 +322,18 @@ def _health_check() -> Dict[str, Any]:
     Returns ok: True with sites count, or ok: False with error.
     """
     try:
+        if IS_CLASSIC:
+            # Classic controllers: prove reachability via the stat/health endpoint.
+            resp = legacy_get("/s/default/stat/health")
+            subsystems = resp.get("data", []) if isinstance(resp, dict) else []
+            return {
+                "ok": True,
+                "subsystems_count": len(subsystems),
+                "subsystems": [s.get("subsystem") for s in subsystems],
+                "base": LEGACY_BASE,
+                "deployment": "classic",
+                "verify_tls": VERIFY_TLS,
+            }
         resp = _get("/".join([NET_INTEGRATION_BASE, "sites"]), _h_key())
         return {
             "ok": True,
@@ -273,7 +342,8 @@ def _health_check() -> Dict[str, Any]:
             "verify_tls": VERIFY_TLS,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e), "base": NET_INTEGRATION_BASE, "verify_tls": VERIFY_TLS}
+        base = LEGACY_BASE if IS_CLASSIC else NET_INTEGRATION_BASE
+        return {"ok": False, "error": str(e), "base": base, "verify_tls": VERIFY_TLS}
 
 # ========= Enhanced List Hosts Functions =========
 def list_hosts_api_ui_com_format():
@@ -350,6 +420,17 @@ def get_correct_site_ids():
     Get the correct site IDs from your controller
     Since 'default' is failing, we need to discover the actual site IDs
     """
+    # Classic controllers: sites come from the legacy API and are keyed by "name"
+    # (e.g. "default"), which is what the stat/rest paths expect.
+    if IS_CLASSIC:
+        try:
+            resp = legacy_get("/self/sites")
+            sites = resp.get("data", [])
+            return [site.get("name") for site in sites if site.get("name")]
+        except Exception as e:
+            print(f"Failed to get sites from Legacy API: {e}")
+            return []
+
     try:
         # Try to get sites from Integration API
         resp = _get(f"{NET_INTEGRATION_BASE}/sites", _h_key())
@@ -357,7 +438,7 @@ def get_correct_site_ids():
         return [site.get("id") for site in sites if site.get("id")]
     except Exception as e:
         print(f"Failed to get sites from Integration API: {e}")
-        
+
         # Try legacy API to get sites
         try:
             legacy_login()
@@ -366,7 +447,7 @@ def get_correct_site_ids():
             return [site.get("name") for site in sites if site.get("name")]
         except Exception as e2:
             print(f"Failed to get sites from Legacy API: {e2}")
-            
+
     return []
 
 def list_hosts_with_correct_sites():
