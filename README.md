@@ -693,3 +693,7 @@ MIT License - see LICENSE file for details.
 ---
 
 **Note:** This server provides comprehensive UniFi infrastructure management through AI-powered natural language interactions. It's designed for both home labs and enterprise environments with robust error handling and multi-API support.
+
+## Fork notes
+
+Fork of ry-ops/unifi-mcp-server for a self-hosted (non-cloud) UniFi controller. Upstream `main` became a cloud-only client; this default branch `self-hosted` stays on the last controller-capable version and adds `UNIFI_DEPLOYMENT=self-hosted` (bare-root paths, `/api/login`). Remotes: `origin` = this fork, `upstream` = ry-ops.
